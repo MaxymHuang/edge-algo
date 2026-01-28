@@ -5,19 +5,24 @@ Edge detection system for Raspberry Pi 5 that analyzes camera input to determine
 ## Features
 
 - Real-time edge detection using Canny algorithm
-- Steering direction analysis based on edge position
+- **ML-based lane detection** using Fast SCNN and YOLOv8 segmentation models
+- **Hybrid detection mode** combining ML predictions with edge detection
+- Steering direction analysis based on lane position
 - Web-based console with:
   - Live camera feed
   - Edge detection visualization
+  - ML lane detection visualization
   - Real-time log messages
   - Steering direction indicator
+  - Model selection interface
 
 ## Requirements
 
-- Raspberry Pi 5
+- Raspberry Pi 5 (8GB RAM recommended for ML models)
 - Raspberry Pi Camera Module
 - Python 3.10+
 - Node.js 18+ (for frontend)
+- **64-bit OS** (required for ML models - 32-bit limits processes to 3GB)
 
 ## Installation
 
@@ -78,6 +83,89 @@ http://<raspberry-pi-ip>:8000
 python -m src.main
 ```
 
+### Run Weight Tuner (Web Interface)
+
+The weight tuner provides a web-based interface for collecting training data and optimizing region weights using Bayesian optimization.
+
+```bash
+# First, build the frontend (if not already built)
+cd frontend
+npm install
+npm run build
+cd ..
+
+# Run the tuner server
+uv run python -m src.run_tuner_server
+```
+
+Or using uvicorn directly:
+
+```bash
+uvicorn src.tuner_server:app --host 0.0.0.0 --port 8001
+```
+
+Then open your browser and navigate to:
+
+```
+http://localhost:8001
+```
+
+**Tuner Features:**
+- Real-time camera feed and edge detection visualization
+- Interactive steering angle controls (buttons for all angle classes)
+- Live sample collection with visual feedback
+- One-click Bayesian optimization
+- View optimization results (best weights and MAE)
+- Save optimized weights to config
+- Reset samples for new training sessions
+
+**Usage:**
+1. Use the steering controls to set your desired steering angle while driving
+2. The system automatically collects samples (edge densities + human angle)
+3. Once you have at least 10 samples, click "Run Optimization"
+4. Review the results and click "Save Weights" to apply them to the config
+
+## ML Model Setup
+
+The system supports ML-based lane detection using Fast SCNN and YOLOv8 segmentation models.
+
+### Download and Prepare Models
+
+1. **Download models**:
+   ```bash
+   python scripts/download_models.py
+   ```
+
+2. **Convert to ONNX** (if needed):
+   - Fast SCNN: Download from GitHub repositories (antoniojkim/Fast-SCNN)
+   - YOLOv8: Automatically downloaded via ultralytics
+
+3. **Quantize models** (recommended for Pi 5):
+   ```bash
+   # Quantize Fast SCNN
+   python scripts/quantize_model.py models/fast_scnn/fast_scnn.onnx models/fast_scnn/fast_scnn_quantized.onnx
+   
+   # Quantize YOLOv8
+   python scripts/quantize_model.py models/yolo/yolov8n_lane_seg.onnx models/yolo/yolov8n_lane_seg_quantized.onnx
+   ```
+
+### Model Performance
+
+- **Fast SCNN**: ~2-5 FPS, ~150-300 MB RAM
+- **YOLOv8n**: ~1-2 FPS, ~200-400 MB RAM
+- **Edge Detection**: ~30 FPS, ~10-20 MB RAM
+
+**Note**: ML models use frame skipping (process every 3rd-5th frame) to maintain responsiveness. See `RESOURCE_EVALUATION.md` for detailed analysis.
+
+### Detection Methods
+
+Configure in `src/config.py` or via web UI:
+
+- **`edge`**: Traditional Canny edge detection (fastest, 30 FPS)
+- **`fast_scnn`**: Fast SCNN semantic segmentation (balanced, 2-5 FPS)
+- **`yolo`**: YOLOv8 segmentation (most accurate, 1-2 FPS)
+- **`hybrid`**: Combines ML predictions (70%) with edge detection (30%)
+
 ## Configuration
 
 Edit `src/config.py` to adjust:
@@ -85,6 +173,7 @@ Edit `src/config.py` to adjust:
 - Canny edge detection thresholds
 - Camera resolution and framerate
 - Steering determination thresholds
+- **ML model settings** (paths, input sizes, frame skipping)
 
 ## Project Structure
 
@@ -96,7 +185,11 @@ vision-algo/
 │   ├── edge_detection.py      # Core edge detection logic
 │   ├── main.py                # Standalone application
 │   ├── web_server.py          # FastAPI web server
-│   └── run_server.py          # Server entry point
+│   ├── tuner_server.py        # Weight tuner web server
+│   ├── weight_tuner.py        # Bayesian optimization logic
+│   ├── run_server.py          # Server entry point
+│   ├── run_tuner.py           # Terminal-based tuner (legacy)
+│   └── run_tuner_server.py     # Tuner server entry point
 ├── frontend/                  # React/TypeScript frontend
 │   ├── src/
 │   │   ├── App.tsx
@@ -246,6 +339,208 @@ Key parameters in `src/config.py`:
 - `REGION_WEIGHTS`: Weight factors `[1.5, 1.2, 0.8, 1.2, 1.5]`
 - `MIN_EDGE_DENSITY`: Minimum density threshold `0.01` (1%)
 - `STEERING_SCORE_THRESHOLD`: Minimum score difference `0.1` (10%)
+
+## Bayesian Optimization for Weight Tuning
+
+### What is Bayesian Optimization?
+
+Bayesian optimization is a powerful technique for finding the optimal values of expensive-to-evaluate functions. Unlike grid search or random search, it uses a probabilistic model (surrogate model) to intelligently explore the parameter space, balancing **exploration** (trying new areas) and **exploitation** (refining promising areas).
+
+#### Key Concepts
+
+1. **Surrogate Model**: A probabilistic model (typically a Gaussian Process) that approximates the objective function based on observed data points
+2. **Acquisition Function**: A strategy for selecting the next point to evaluate, balancing exploration vs exploitation
+3. **Prior Knowledge**: Incorporates beliefs about the function before seeing data
+4. **Posterior Updates**: Updates beliefs after each evaluation using Bayes' theorem
+
+#### How Bayesian Optimization Works
+
+```
+1. Initialize with a few random samples
+   ↓
+2. Build surrogate model (probabilistic approximation of objective function)
+   ↓
+3. Use acquisition function to select next promising point
+   ↓
+4. Evaluate objective function at selected point
+   ↓
+5. Update surrogate model with new observation
+   ↓
+6. Repeat steps 3-5 until convergence or budget exhausted
+```
+
+**Advantages over brute-force methods:**
+- **Efficient**: Requires fewer function evaluations
+- **Adaptive**: Learns from previous evaluations
+- **Handles noise**: Works well with noisy objective functions
+- **Global optimization**: Can escape local minima
+
+### Application in This Project
+
+In this vision steering system, Bayesian optimization is used to automatically tune the **region weights** (`REGION_WEIGHTS`) that determine how much influence each horizontal region of the frame has on steering angle prediction.
+
+#### Problem Statement
+
+The steering algorithm uses five region weights: `[far_left, left, center, right, far_right]`. These weights control how edge densities in each region contribute to the final steering decision. Finding optimal weights manually is difficult because:
+
+- The relationship between weights and steering accuracy is complex and non-linear
+- Each evaluation requires collecting real-world driving data
+- The search space is continuous (infinite possible weight combinations)
+- Weights must be symmetric (left/right symmetry constraint)
+
+#### Implementation Details
+
+The optimization is implemented in `src/weight_tuner.py` using **Optuna** with the **TPE (Tree-structured Parzen Estimator)** sampler.
+
+##### 1. Objective Function
+
+The optimization minimizes **Mean Absolute Error (MAE)** between predicted and human-provided steering angles:
+
+```python
+MAE = mean(|predicted_angle - human_angle|)
+```
+
+For each trial:
+1. Sample candidate weights from the search space
+2. Apply weights to all collected training samples
+3. Calculate predicted angles using the candidate weights
+4. Compute MAE across all samples
+5. Return MAE as the objective value
+
+##### 2. Search Space and Constraints
+
+The optimization uses **symmetric weight constraints** to reduce the search space:
+
+- **Outer weights** (far-left, far-right): Range `[1.0, 2.0]` - shared value
+- **Inner weights** (left, right): Range `[0.8, 1.5]` - shared value  
+- **Center weight**: Range `[0.5, 1.2]` - independent value
+
+Final weight vector: `[outer, inner, center, inner, outer]`
+
+This constraint:
+- Reduces search space from 5D to 3D
+- Enforces left-right symmetry (realistic for lane detection)
+- Speeds up convergence
+
+##### 3. TPE Sampler
+
+The project uses **TPE (Tree-structured Parzen Estimator)** as the Bayesian optimization algorithm:
+
+- **How it works**: Models the distribution of good vs bad hyperparameters
+  - Splits observations into "good" (top quantile) and "bad" (bottom quantile) groups
+  - Models each group using Parzen estimators (kernel density estimation)
+  - Samples new candidates from the "good" distribution, avoiding the "bad" distribution
+
+- **Why TPE**: 
+  - Handles mixed continuous/discrete spaces well
+  - Efficient for moderate number of trials (30-100)
+  - Built into Optuna with good defaults
+
+##### 4. Data Collection Workflow
+
+The optimization process follows this workflow:
+
+```
+1. Collect Training Data
+   ├─ Run camera feed in real-time
+   ├─ Human provides steering input via keyboard (arrow keys)
+   ├─ System captures: (edge_densities, human_angle) pairs
+   └─ Store samples in buffer (SteeringDataCollector)
+
+2. Run Optimization
+   ├─ Initialize Optuna study with TPE sampler
+   ├─ For each trial (default: 30 trials):
+   │  ├─ Sample candidate weights
+   │  ├─ Evaluate MAE on all collected samples
+   │  └─ Update TPE model
+   └─ Return best weights and MAE
+
+3. Apply Results
+   ├─ Save best weights to config.py
+   └─ Use optimized weights in production
+```
+
+#### Code Structure
+
+The implementation consists of three main components:
+
+1. **`SteeringDataCollector`**: Collects and buffers training samples
+   - Stores `(densities, human_angle)` pairs
+   - Maintains a rolling buffer (default: 1000 samples)
+   - Provides sample access for optimization
+
+2. **`WeightOptimizer`**: Performs Bayesian optimization
+   - Wraps Optuna study creation and execution
+   - Implements symmetric weight constraints
+   - Manages optimization trials and results
+
+3. **`calculate_steering_with_weights()`**: Evaluates candidate weights
+   - Takes densities and weights as input
+   - Computes predicted steering angle
+   - Used by optimizer to evaluate each trial
+
+#### Usage
+
+To use the weight tuner:
+
+```bash
+uv run python -m src.run_tuner
+```
+
+**Interactive Controls:**
+- **Arrow Keys**: Provide human steering input (left/right/straight)
+- **O**: Run optimization with current samples
+- **S**: Save best weights to `config.py`
+- **R**: Reset/clear collected samples
+- **Q**: Quit
+
+**Best Practices:**
+1. Collect diverse samples: drive in various scenarios (straight, turns, curves)
+2. Collect sufficient data: at least 100-500 samples for reliable optimization
+3. Run multiple optimizations: verify consistency across runs
+4. Validate on new data: test optimized weights on unseen scenarios
+
+#### Optimization Parameters
+
+Key parameters in `WeightOptimizer`:
+
+- **`n_trials`**: Number of optimization trials (default: 30)
+  - More trials = better optimization but slower
+  - Recommended: 30-100 trials depending on data size
+
+- **Weight ranges**: Define search space bounds
+  - `outer_weight_range`: `(1.0, 2.0)` - outer region emphasis
+  - `inner_weight_range`: `(0.8, 1.5)` - inner region emphasis
+  - `center_weight_range`: `(0.5, 1.2)` - center region emphasis
+
+#### Example Optimization Result
+
+After optimization, you might see:
+
+```
+Optimization complete. Best MAE: 8.5°
+Best weights: outer=1.65, inner=1.15, center=0.92
+Final weight vector: [1.65, 1.15, 0.92, 1.15, 1.65]
+```
+
+This means:
+- The optimized weights reduce prediction error to 8.5° average
+- Outer regions are weighted 1.65× (emphasizing lane edges)
+- Inner regions are weighted 1.15× (moderate emphasis)
+- Center region is weighted 0.92× (slight de-emphasis)
+
+#### Why Bayesian Optimization is Ideal Here
+
+1. **Expensive Evaluation**: Each weight evaluation requires processing all training samples
+2. **Noisy Objective**: Steering prediction has inherent variability
+3. **Limited Budget**: Can only run a limited number of trials
+4. **Non-convex**: The relationship between weights and accuracy is complex
+5. **Continuous Space**: Weights are continuous values, not discrete choices
+
+Traditional methods (grid search, random search) would require:
+- Grid search: 10^5 = 100,000 evaluations (for 5 weights with 10 values each)
+- Random search: Thousands of random trials
+- Bayesian optimization: ~30-100 intelligent trials
 
 ## License
 

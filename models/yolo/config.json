@@ -1,0 +1,9 @@
+{
+  "model_type": "yolov8n_seg",
+  "input_size": [
+    416,
+    416
+  ],
+  "confidence_threshold": 0.25,
+  "description": "YOLOv8n segmentation for lane detection"
+}

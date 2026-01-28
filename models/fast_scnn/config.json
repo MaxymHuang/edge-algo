@@ -1,0 +1,10 @@
+{
+  "model_type": "fast_scnn",
+  "input_size": [
+    320,
+    240
+  ],
+  "num_classes": 19,
+  "lane_class": 6,
+  "description": "Fast SCNN for lane detection"
+}

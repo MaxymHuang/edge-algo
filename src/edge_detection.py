@@ -28,6 +28,10 @@ from .config import (
     REGION_WEIGHTS,
     ANGLE_DENSITY_THRESHOLD,
     STEERING_SCORE_THRESHOLD,
+    PATH_FOLLOWING_MODE,
+    MIN_PATH_DENSITY_THRESHOLD,
+    PATH_STEERING_THRESHOLD,
+    SPARSE_EDGE_MODE,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,7 +126,7 @@ class EdgeDetector:
             return None
     
     def detect_edges(self, frame: np.ndarray) -> np.ndarray:
-        """Apply Canny edge detection to the frame."""
+        """Apply enhanced Canny edge detection with Sobel fallback for sparse scenarios."""
         if frame is None:
             return None
         
@@ -132,14 +136,25 @@ class EdgeDetector:
         else:
             gray = frame
         
+        # Apply contrast enhancement for sparse edge scenarios
+        if SPARSE_EDGE_MODE:
+            # Use CLAHE (Contrast Limited Adaptive Histogram Equalization) for better contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+        
         # Apply Gaussian blur to reduce noise
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
         # Apply adaptive thresholding to improve edge detection
         # Calculate median of the image for adaptive thresholds
         median = np.median(blurred)
-        lower = int(max(0, 0.7 * median))
-        upper = int(min(255, 1.3 * median))
+        # More aggressive thresholds for sparse scenarios
+        if SPARSE_EDGE_MODE:
+            lower = int(max(0, 0.5 * median))  # More aggressive lower threshold
+            upper = int(min(255, 1.5 * median))
+        else:
+            lower = int(max(0, 0.7 * median))
+            upper = int(min(255, 1.3 * median))
         
         # Use adaptive thresholds or fallback to config values
         low_thresh = max(CANNY_LOW_THRESHOLD, lower)
@@ -147,6 +162,26 @@ class EdgeDetector:
         
         # Apply Canny edge detection
         edges = cv2.Canny(blurred, low_thresh, high_thresh)
+        
+        # Fallback to Sobel operator if too few edges detected (sparse scenario)
+        if SPARSE_EDGE_MODE:
+            edge_count = np.sum(edges > 0)
+            total_pixels = edges.size
+            edge_density = edge_count / total_pixels if total_pixels > 0 else 0.0
+            
+            # If edge density is very low, try Sobel as fallback
+            if edge_density < 0.001:  # Less than 0.1% edges detected
+                # Apply Sobel operator
+                sobel_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+                sobel_y = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+                sobel_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+                sobel_magnitude = np.uint8(np.clip(sobel_magnitude, 0, 255))
+                
+                # Threshold Sobel result
+                _, sobel_edges = cv2.threshold(sobel_magnitude, 30, 255, cv2.THRESH_BINARY)
+                
+                # Combine Canny and Sobel results
+                edges = cv2.bitwise_or(edges, sobel_edges)
         
         return edges
     
@@ -191,9 +226,107 @@ class EdgeDetector:
         
         return (far_left_density, left_density, center_density, right_density, far_right_density)
     
+    def _find_least_dense_region(self, densities: Tuple[float, float, float, float, float]) -> int:
+        """
+        Find the region with minimum edge density (the path).
+        
+        Args:
+            densities: Tuple of (far_left, left, center, right, far_right) densities
+            
+        Returns:
+            Index of region with minimum density (0=far_left, 1=left, 2=center, 3=right, 4=far_right)
+        """
+        min_density = min(densities)
+        # Find all regions with minimum density (handle ties)
+        min_indices = [i for i, d in enumerate(densities) if d == min_density]
+        # If multiple regions have same minimum, prefer center region
+        if 2 in min_indices:
+            return 2
+        # Otherwise return the first minimum index
+        return min_indices[0]
+    
+    def _calculate_path_steering(
+        self, 
+        least_dense_idx: int, 
+        densities: Tuple[float, float, float, float, float]
+    ) -> Tuple[int, Dict[str, any]]:
+        """
+        Calculate steering angle to move towards the least dense region (path).
+        
+        Args:
+            least_dense_idx: Index of region with minimum density (0-4)
+            densities: Tuple of region densities
+            
+        Returns:
+            Tuple of (steering_angle, detailed_info_dict)
+        """
+        far_left_density, left_density, center_density, right_density, far_right_density = densities
+        
+        # Camera center is at region index 2 (center region: 40-60% of width)
+        CENTER_REGION_IDX = 2
+        
+        # Calculate density difference to determine steering magnitude
+        min_density = densities[least_dense_idx]
+        max_density = max(densities)
+        density_diff = max_density - min_density
+        
+        # Check if density difference is significant enough
+        if density_diff < PATH_STEERING_THRESHOLD:
+            # Not enough difference, steer straight
+            return (0, {
+                "region_densities": {
+                    "far_left": float(far_left_density),
+                    "left": float(left_density),
+                    "center": float(center_density),
+                    "right": float(right_density),
+                    "far_right": float(far_right_density)
+                },
+                "least_dense_region": least_dense_idx,
+                "min_density": float(min_density),
+                "max_density": float(max_density),
+                "density_diff": float(density_diff),
+                "steering_score": 0.0,
+                "method": "path_following"
+            })
+        
+        # Calculate steering direction relative to center
+        # Region indices: 0=far_left, 1=left, 2=center, 3=right, 4=far_right
+        # Steering score: negative = left, positive = right, 0 = straight
+        # Formula: -1.0 + (idx * 0.5) gives: [-1.0, -0.5, 0.0, 0.5, 1.0]
+        steering_score = -1.0 + (least_dense_idx * 0.5)
+        
+        # Scale steering score by density difference (stronger difference = stronger steering)
+        # Normalize density_diff to [0, 1] range for scaling
+        normalized_diff = min(1.0, density_diff / MIN_PATH_DENSITY_THRESHOLD)
+        steering_score = steering_score * normalized_diff
+        
+        # Map steering score to discrete angle classes
+        if abs(steering_score) < STEERING_SCORE_THRESHOLD:
+            angle = 0
+        else:
+            target_angle = steering_score * max(STEERING_ANGLE_CLASSES)
+            angle = min(STEERING_ANGLE_CLASSES, key=lambda x: abs(x - target_angle))
+        
+        return (angle, {
+            "region_densities": {
+                "far_left": float(far_left_density),
+                "left": float(left_density),
+                "center": float(center_density),
+                "right": float(right_density),
+                "far_right": float(far_right_density)
+            },
+            "least_dense_region": least_dense_idx,
+            "min_density": float(min_density),
+            "max_density": float(max_density),
+            "density_diff": float(density_diff),
+            "steering_score": float(steering_score),
+            "normalized_diff": float(normalized_diff),
+            "method": "path_following"
+        })
+    
     def calculate_steering_angle(self, edges: np.ndarray) -> Tuple[int, Dict[str, any]]:
         """
-        Calculate steering angle based on weighted edge density distribution.
+        Calculate steering angle based on path-following: steer towards least dense region.
         
         Args:
             edges: Edge detection result
@@ -206,19 +339,28 @@ class EdgeDetector:
         if edges is None:
             return (0, {
                 "region_densities": {"far_left": 0.0, "left": 0.0, "center": 0.0, "right": 0.0, "far_right": 0.0},
-                "weighted_densities": {"far_left": 0.0, "left": 0.0, "center": 0.0, "right": 0.0, "far_right": 0.0},
-                "left_score": 0.0,
-                "right_score": 0.0,
-                "total_score": 0.0,
+                "least_dense_region": 2,
+                "min_density": 0.0,
+                "max_density": 0.0,
+                "density_diff": 0.0,
                 "steering_score": 0.0,
-                "total_density": 0.0
+                "method": "path_following"
             })
         
         # Calculate densities for each region
         densities = self.calculate_region_densities(edges)
         far_left_density, left_density, center_density, right_density, far_right_density = densities
         
-        # Check if we have enough edges to make a decision
+        # Use path-following mode if enabled
+        if PATH_FOLLOWING_MODE:
+            # Find the region with minimum density (this is the path)
+            least_dense_idx = self._find_least_dense_region(densities)
+            
+            # Calculate steering to move towards the least dense region
+            return self._calculate_path_steering(least_dense_idx, densities)
+        
+        # Fallback to old obstacle avoidance logic if path-following is disabled
+        # (for backward compatibility)
         total_density = sum(densities) / len(densities)
         
         # Apply weights to densities
@@ -231,30 +373,22 @@ class EdgeDetector:
         ]
         
         # Calculate weighted left and right scores
-        # Left side: far-left and left regions
         left_score = weighted_densities[0] + weighted_densities[1]
-        # Right side: right and far-right regions
         right_score = weighted_densities[3] + weighted_densities[4]
         
-        # Calculate steering score (normalized difference)
         total_score = left_score + right_score
         
-        # Normalized score: -1 (hard left) to +1 (hard right)
         if total_score == 0:
             steering_score = 0.0
             angle = 0
         else:
-            steering_score = (right_score - left_score) / total_score
+            steering_score = (left_score - right_score) / total_score
             
-            # Check if we have enough edges to make a decision
             if total_density < MIN_EDGE_DENSITY:
-                angle = 0  # Straight
-            # Check if difference is significant enough
+                angle = 0
             elif abs(steering_score) < STEERING_SCORE_THRESHOLD:
-                angle = 0  # Straight
+                angle = 0
             else:
-                # Map steering score to discrete angle classes
-                # Find the closest angle class
                 angle = min(STEERING_ANGLE_CLASSES, key=lambda x: abs(x - (steering_score * max(STEERING_ANGLE_CLASSES))))
         
         detailed_info = {
@@ -276,7 +410,8 @@ class EdgeDetector:
             "right_score": float(right_score),
             "total_score": float(total_score),
             "steering_score": float(steering_score),
-            "total_density": float(total_density)
+            "total_density": float(total_density),
+            "method": "obstacle_avoidance"
         }
         
         return (angle, detailed_info)

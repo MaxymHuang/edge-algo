@@ -11,7 +11,9 @@ const LogMessages = () => {
   const logContainerRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    const ws = new WebSocket(`ws://${window.location.host}/api/logs`)
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const host = window.location.host
+    const ws = new WebSocket(`${protocol}//${host}/api/logs`)
     
     ws.onmessage = (event) => {
       const logEntry: LogEntry = JSON.parse(event.data)

@@ -45,3 +45,22 @@ Thumbs.db
 # Logs
 *.log
 
+# Model files and artifacts
+*.onnx
+*.pt
+*.pth
+*.h5
+*.pb
+*.tflite
+*.pkl
+*.pickle
+*.weights
+*.ckpt
+*.safetensors
+models/**/*.onnx
+models/**/*.pt
+models/**/*.pth
+models/**/*.h5
+models/**/*.pb
+models/**/*.tflite
+

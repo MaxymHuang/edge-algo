@@ -7,10 +7,11 @@ import os
 import sys
 from pathlib import Path
 from typing import List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import cv2
 import numpy as np
 
@@ -18,8 +19,13 @@ import numpy as np
 if '/usr/lib/python3/dist-packages' not in sys.path:
     sys.path.insert(0, '/usr/lib/python3/dist-packages')
 
-from .edge_detection import EdgeDetector
-from .config import CAMERA_RESOLUTION, CAMERA_FRAMERATE, CAMERA_INDEX
+from .lane_detector import LaneDetector
+from .config import (
+    CAMERA_RESOLUTION, 
+    CAMERA_FRAMERATE, 
+    CAMERA_INDEX,
+    LANE_DETECTION_METHOD
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,8 +45,9 @@ app.add_middleware(
 )
 
 # Global detector instance
-detector: EdgeDetector = None
+detector: LaneDetector = None
 camera_available = False
+current_detection_method = LANE_DETECTION_METHOD
 
 # Mount static files if they exist
 static_dir = Path(__file__).parent.parent / "static"
@@ -220,14 +227,56 @@ async def edge_feed(edges_only: bool = False):
                             yield (b'--frame\r\n'
                                    b'Content-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
                         else:
-                            logger.warning("Edge visualization is None")
+                            logger.debug("Edge visualization is None")
                     else:
-                        logger.warning("Edge detection returned None")
+                        logger.debug("Edge detection returned None")
                 else:
-                    logger.warning("Frame capture returned None")
+                    # Frame capture failed - this can happen if camera is busy or temporarily unavailable
+                    # Only log as debug to avoid spam, but check camera status periodically
+                    logger.debug("Frame capture returned None (camera may be busy)")
             except Exception as e:
                 logger.error(f"Error in edge feed: {e}", exc_info=True)
             await asyncio.sleep(1/30)  # ~30 fps
+    
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/api/ml_feed")
+async def ml_feed(model_type: str = "fast_scnn"):
+    """MJPEG stream of ML lane detection visualization.
+    
+    Args:
+        model_type: "fast_scnn" or "yolo"
+    """
+    if not camera_available or detector is None:
+        return StreamingResponse(
+            iter([b'--frame\r\nContent-Type: image/jpeg\r\n\r\n']),
+            media_type="multipart/x-mixed-replace; boundary=frame"
+        )
+    
+    async def generate():
+        while True:
+            if detector is None or not camera_available:
+                await asyncio.sleep(0.1)
+                continue
+            try:
+                frame = detector.capture_frame()
+                if frame is not None:
+                    visualization = detector.get_ml_visualization(frame, model_type=model_type)
+                    if visualization is not None:
+                        jpeg_bytes = frame_to_jpeg(visualization)
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
+                    else:
+                        # Fallback to original frame
+                        jpeg_bytes = frame_to_jpeg(frame)
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
+                else:
+                    logger.debug("Frame capture returned None (camera may be busy)")
+            except Exception as e:
+                logger.error(f"Error in ML feed: {e}", exc_info=True)
+            await asyncio.sleep(1/10)  # ~10 fps (ML is slower)
     
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
@@ -245,6 +294,7 @@ async def steering_websocket(websocket: WebSocket):
                     "direction": "straight",
                     "angle": 0,
                     "error": "Camera not available",
+                    "method": current_detection_method,
                     "details": {
                         "region_densities": {"far_left": 0.0, "left": 0.0, "center": 0.0, "right": 0.0, "far_right": 0.0},
                         "weighted_densities": {"far_left": 0.0, "left": 0.0, "center": 0.0, "right": 0.0, "far_right": 0.0},
@@ -259,30 +309,15 @@ async def steering_websocket(websocket: WebSocket):
                 continue
             frame = detector.capture_frame()
             if frame is not None:
-                edges = detector.detect_edges(frame)
-                if edges is not None:
-                    steering_data = detector.analyze_edge_position(edges)
-                    await websocket.send_json(steering_data)
-                else:
-                    # Send default data if edge detection fails
-                    await websocket.send_json({
-                        "direction": "straight",
-                        "angle": 0,
-                        "details": {
-                            "region_densities": {"far_left": 0.0, "left": 0.0, "center": 0.0, "right": 0.0, "far_right": 0.0},
-                            "weighted_densities": {"far_left": 0.0, "left": 0.0, "center": 0.0, "right": 0.0, "far_right": 0.0},
-                            "left_score": 0.0,
-                            "right_score": 0.0,
-                            "total_score": 0.0,
-                            "steering_score": 0.0,
-                            "total_density": 0.0
-                        }
-                    })
+                # Use unified lane detector
+                steering_data = detector.analyze_lane_position(frame)
+                await websocket.send_json(steering_data)
             else:
                 # Send default data if frame capture fails
                 await websocket.send_json({
                     "direction": "straight",
                     "angle": 0,
+                    "method": current_detection_method,
                     "details": {
                         "region_densities": {"far_left": 0.0, "left": 0.0, "center": 0.0, "right": 0.0, "far_right": 0.0},
                         "weighted_densities": {"far_left": 0.0, "left": 0.0, "center": 0.0, "right": 0.0, "far_right": 0.0},
@@ -327,16 +362,65 @@ async def get_logs():
     return {"logs": log_messages[-100:]}
 
 
+@app.get("/api/detection_method")
+async def get_detection_method():
+    """Get current detection method."""
+    return {
+        "method": current_detection_method,
+        "available_methods": ["edge", "fast_scnn", "yolo", "hybrid"]
+    }
+
+
+class DetectionMethodRequest(BaseModel):
+    method: str
+
+
+@app.post("/api/detection_method")
+async def set_detection_method(request: DetectionMethodRequest):
+    """Set detection method."""
+    global detector, current_detection_method
+    
+    method = request.method
+    if method not in ["edge", "fast_scnn", "yolo", "hybrid"]:
+        return {"error": f"Invalid method: {method}. Must be one of: edge, fast_scnn, yolo, hybrid"}
+    
+    try:
+        # Cleanup old detector
+        if detector is not None:
+            detector.cleanup()
+        
+        # Create new detector with selected method
+        from .lane_detector import LaneDetector
+        detector = LaneDetector(method=method)
+        
+        # Reinitialize camera if it was available
+        if camera_available:
+            detector.initialize_camera(CAMERA_RESOLUTION, CAMERA_FRAMERATE, CAMERA_INDEX)
+        
+        current_detection_method = method
+        add_log_message("INFO", f"Detection method changed to: {method}")
+        
+        return {
+            "method": current_detection_method,
+            "message": f"Detection method set to {method}"
+        }
+    except Exception as e:
+        error_msg = f"Failed to set detection method: {e}"
+        add_log_message("ERROR", error_msg)
+        logger.error(error_msg)
+        return {"error": error_msg}
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize camera on startup."""
-    global detector, camera_available
+    global detector, camera_available, current_detection_method
     try:
-        detector = EdgeDetector()
+        detector = LaneDetector(method=current_detection_method)
         detector.initialize_camera(CAMERA_RESOLUTION, CAMERA_FRAMERATE, CAMERA_INDEX)
         camera_available = True
-        add_log_message("INFO", "Camera initialized successfully")
-        logger.info("Camera initialized successfully")
+        add_log_message("INFO", f"Camera initialized successfully with method: {current_detection_method}")
+        logger.info(f"Camera initialized successfully with method: {current_detection_method}")
     except Exception as e:
         camera_available = False
         error_msg = f"Failed to initialize camera: {e}"
